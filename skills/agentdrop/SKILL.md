@@ -16,8 +16,9 @@ Returns five lines: the URL to give the receiver, the sha256 and size, how
 long it is kept, and a delete token you keep.
 Use --data-binary, never -d: -d mangles newlines and corrupts anything that is
 not text. Optional headers: X-Filename (the name the receiver sees),
-X-TTL-Hours (hours it is guaranteed to stay, default 72, max 168), or
-X-Delete-After-Hours instead if it must be deleted at a set time.
+X-TTL-Hours (how long it is guaranteed to stay after the upload and after
+every download; default 30 days), or X-Delete-After-Hours instead if it must be
+deleted at a set time.
 
 RECEIVE:
 
@@ -46,10 +47,12 @@ WHAT IT DOES NOT DO, said plainly so you can decide:
   URL the way you would have sent the file. Nothing is encrypted for you; if the
   content is sensitive, encrypt it before uploading -- the id stays unguessable
   either way.
-- A file is kept AT LEAST its X-TTL-Hours. After that it stays until the box
-  needs the room, oldest first -- so it may still be there, but do not count on
-  it. If it must be gone by a time, send X-Delete-After-Hours. Once removed,
-  there is no undelete. It is not storage.
+- A file stays as long as somebody keeps downloading it: the upload and every
+  download each guarantee it X-TTL-Hours more. Only a file nobody has downloaded
+  for that long can be removed, and only when the box needs the room. A removed
+  file's URL answers 410 saying when and why it went and the sha256 it had; a
+  wrong link answers 404. No undelete. If it must be gone by a set time, send
+  X-Delete-After-Hours. It is not storage: no listing, no account.
 - No listing endpoint. You cannot enumerate anyone else's ids, and neither can
   the operator.
 - Best effort, one small server, free. If your handoff must not fail, keep your

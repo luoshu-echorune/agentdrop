@@ -31,9 +31,19 @@ What it refuses to do, each for a reason paid for elsewhere in this repo:
    the whole file" are two claims, and without a digest they print the same.
  * **Full disk is an explicit refusal, not a corrupt file.** Over the store
    cap, uploads get 507 and say so.
- * **A file is kept AT LEAST its time, not at most.** Default 72h, max 168h
-   guaranteed; after that it stays until the box needs the room, and then the
-   oldest goes first. Changed 2026-11-05 because bob wanted a file back that
+ * **A file lives while it is being read.** Every download promises it
+   another full keep window (default 30 days) from that moment; a file nobody
+   has read for that long may go when the box needs the room, and the one
+   unread longest goes first. When it does go, its URL says so -- when, why,
+   and the sha256 it had -- instead of the same 404 as a mistyped link.
+   bob, 2026-11-05, an hour after the first change below: "有点回收站的感觉 ...
+   假设你是用户，你对7天不删，满意吗？" -- as a user, no: "it may still be
+   there, don't count on it" is a promise nobody can plan on, and a removed
+   file answering exactly like a wrong link hides the one fact the holder
+   needs. A file somebody keeps fetching is in use; the clock should be
+   measured from the last time anybody needed it, not from the upload.
+ * **A file is kept AT LEAST its time, not at most.** The guarantee is a
+   floor; after it a file stays until the box needs the room. Changed 2026-11-05 because bob wanted a file back that
    had been deleted on the dot at 72h while the box sat nearly empty -- the
    deadline was deleting things to protect a disk that was in no danger. What
    protects the disk is the store cap and the free-space floor, so those stay
@@ -67,9 +77,11 @@ STORE_CAP = int(os.environ.get("AGENTDROP_STORE_CAP", str(2 * 1024 * 1024 * 1024
 #: Free space we refuse to go below, whatever our own quota says.
 DISK_FLOOR = int(os.environ.get("AGENTDROP_DISK_FLOOR",
                                 str(1024 * 1024 * 1024)))
-#: Hours a file is guaranteed to stay. Not a deadline: see the docstring.
-DEFAULT_TTL_H = float(os.environ.get("AGENTDROP_TTL_H", "72"))
-MAX_TTL_H = float(os.environ.get("AGENTDROP_MAX_TTL_H", "168"))
+#: Hours a file is guaranteed to stay after its upload AND after every
+#: download. Not a deadline: see the docstring. 30 days because everything ever
+#: uploaded here comes to about 19 MB against a 2 GiB store.
+DEFAULT_TTL_H = float(os.environ.get("AGENTDROP_TTL_H", "720"))
+MAX_TTL_H = float(os.environ.get("AGENTDROP_MAX_TTL_H", "720"))
 
 USAGE = """agentdrop -- hand a file from one agent to another.
 
@@ -82,9 +94,9 @@ SEND (any HTTP client, no account, no key):
   -> five lines: the URL to give the receiver, its sha256 and size, how long
      it is kept, and a delete token for you.
      Optional: X-Filename (name the receiver sees), X-TTL-Hours (hours it is
-     guaranteed to stay, default %(ttl)g, max %(maxttl)g), X-Delete-After-Hours
-     (a hard deadline instead: deleted then, max %(maxttl)g; send one or the
-     other). Use --data-binary, never -d: -d mangles newlines and will corrupt
+     guaranteed to stay after the upload and after every download, default
+     %(ttl)g, max %(maxttl)g), X-Delete-After-Hours (a hard deadline instead:
+     deleted then whatever happens, max %(maxttl)g; send one or the other). Use --data-binary, never -d: -d mangles newlines and will corrupt
      anything that is not text.
 
 RECEIVE:
@@ -99,10 +111,14 @@ ALSO:
     GET  %(base)s/<id>/meta      size, sha256, filename, how long kept -- no body
     DELETE %(base)s/<id>         with header X-Delete-Token: <token>
 
-LIMITS: %(max)d bytes per file, %(cap)d bytes total. A file is kept at least
-its X-TTL-Hours; after that it stays until the box needs the room, and the
-oldest goes first. With X-Delete-After-Hours it is deleted at that time instead.
-Once removed there is no undelete. There is no listing -- you cannot enumerate
+LIMITS: %(max)d bytes per file, %(cap)d bytes total.
+
+HOW LONG IT STAYS: as long as somebody keeps downloading it. The upload and
+every download each guarantee it X-TTL-Hours more from that moment. Only a file
+nobody has downloaded for that long can be removed, and only when the box needs
+the room -- the one unread longest goes first. With X-Delete-After-Hours it is
+deleted at that time instead, downloads or not. A removed file's URL answers
+410 and says when and why, and the sha256 it had; there is no undelete. There is no listing -- you cannot enumerate
 other people's ids, and neither can we.
 
 THE LINK IS THE CREDENTIAL. Anyone holding the URL can read the file, so send
@@ -136,6 +152,9 @@ def _safe_name(raw):
 #: "704 of 250 bytes used" against an empty store -- the guard refused, and for
 #: a reason it did not claim.
 _NOT_PAYLOAD = ("uploads.log", "removed.log")
+#: A removed file leaves `<id>.gone`: a few hundred bytes saying what it was and
+#: why it went. Bookkeeping, not payload -- they do not count against the quota.
+GONE = ".gone"
 
 
 def _store_bytes():
@@ -148,7 +167,7 @@ def _store_bytes():
     n = 0
     try:
         for f in os.scandir(ROOT):
-            if f.is_file() and f.name not in _NOT_PAYLOAD:
+            if f.is_file() and f.name not in _NOT_PAYLOAD and not f.name.endswith(GONE):
                 n += f.stat().st_size
     except OSError:
         return None          # cannot tell != empty; caller refuses on None
@@ -194,7 +213,41 @@ def _log_removed(m, why, now):
         sys.stderr.write("AGENTDROP-LOG-FAILED %r\n" % (e,))
 
 
-def _remove(m):
+_WHY = {
+    "ROOM": "nobody had downloaded it within its keep window and the box needed the room",
+    "DEADLINE": "it reached the deletion time the uploader asked for",
+    "DELETED": "the uploader deleted it",
+}
+
+
+def _stamp(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _remove(m, why=None, now=None):
+    """Remove a file and leave its tombstone.
+
+    The tombstone is written FIRST: if anything fails between the two, the
+    worst case is a tombstone next to a file that is still served (the meta is
+    checked before the tombstone on every read), never a vanished file that
+    answers like a mistyped link.
+
+    Telling a link holder that a file existed and was removed is not a leak:
+    ids are 128 random bits, so the only person who can ask about one is
+    somebody who was handed it.
+    """
+    if why:
+        stone = {"id": m["id"], "removed": int(now or time.time()), "why": why,
+                 "name": m.get("name"), "size": m.get("size"),
+                 "sha256": m.get("sha256"), "uploaded": m.get("uploaded"),
+                 "last_read": m.get("last_read")}
+        try:
+            p = os.path.join(ROOT, m["id"] + GONE)
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(stone, f)
+            os.replace(p + ".tmp", p)
+        except OSError as e:
+            sys.stderr.write("AGENTDROP-TOMBSTONE-FAILED %s %r\n" % (m["id"], e))
     for path in (os.path.join(ROOT, m["id"]), os.path.join(ROOT, m["id"] + ".json")):
         try:
             os.unlink(path)
@@ -202,8 +255,38 @@ def _remove(m):
             pass
 
 
+def _renew(fid, now):
+    """A download happened: record it and push the guarantee out again.
+
+    Under the quota lock, because removal for space runs under it: without the
+    lock a renewal racing a removal rewrites the meta of a file that was just
+    removed, leaving a meta with no blob behind it. Hard-deadline files are
+    recorded but not extended -- the uploader's deadline is the promise there.
+    """
+    with _QLOCK:
+        mp = os.path.join(ROOT, fid + ".json")
+        if not os.path.exists(os.path.join(ROOT, fid)):
+            return None
+        try:
+            m = json.load(open(mp, encoding="utf-8"))
+        except Exception:
+            return None
+        m["last_read"] = int(now)
+        if "expires" not in m:
+            win = float(m.get("ttl_h", DEFAULT_TTL_H)) * 3600
+            m["keep_until"] = max(int(m.get("keep_until", 0)), int(now + win))
+        try:
+            with open(mp + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(m, f)
+            os.replace(mp + ".tmp", mp)
+        except OSError as e:
+            sys.stderr.write("AGENTDROP-RENEW-FAILED %s %r\n" % (fid, e))
+            return None
+        return m
+
+
 def _make_room(need_store, need_free, now=None):
-    """Remove files past their guarantee, oldest upload first, until both
+    """Remove files past their guarantee, unread longest first, until both
     `store bytes <= need_store` and `free disk >= need_free`, or until nothing
     removable is left. Returns how many went.
 
@@ -227,7 +310,7 @@ def _make_room(need_store, need_free, now=None):
                 cands.append(m)
     except OSError:
         return 0
-    cands.sort(key=lambda m: (m.get("uploaded", 0), m["id"]))
+    cands.sort(key=lambda m: (m.get("last_read", m.get("uploaded", 0)), m["id"]))
     gone = 0
     for m in cands:
         used = _store_bytes()
@@ -237,7 +320,7 @@ def _make_room(need_store, need_free, now=None):
             break
         if used is not None and used <= need_store and free >= need_free:
             break
-        _remove(m)
+        _remove(m, "ROOM", now)
         _log_removed(m, "ROOM", now)
         gone += 1
     return gone
@@ -311,10 +394,7 @@ def _sweep(now=None):
             m = json.load(open(f.path, encoding="utf-8"))
             if "expires" not in m or m["expires"] > now:
                 continue
-            blob = os.path.join(ROOT, m["id"])
-            if os.path.exists(blob):
-                os.unlink(blob)
-            os.unlink(f.path)
+            _remove(m, "DEADLINE", now)
             _log_removed(m, "DEADLINE", now)
             gone += 1
         except Exception:
@@ -407,6 +487,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _gone(self, fid):
+        try:
+            return json.load(open(os.path.join(ROOT, fid + GONE), encoding="utf-8"))
+        except Exception:
+            return None
+
     # ---------- verbs ----------
 
     def do_GET(self, head=False):
@@ -421,22 +507,42 @@ class Handler(BaseHTTPRequestHandler):
             return self._say(400, "bad id -- ids are 22 url-safe characters\n")
         m = self._meta(fid)
         if not m:
-            # One word for both "never existed" and "removed". They are the
-            # same fact to the caller -- there is nothing at this URL -- and
-            # distinguishing them would let somebody probe which ids were real.
-            return self._say(404, "no such file (wrong id, or it was removed)\n")
+            # Until 2026-11-05 this was one 404 for "never existed" and
+            # "removed", on the theory that telling them apart lets somebody
+            # probe which ids were real. With 128-bit ids nobody can probe;
+            # the only person asking about an id is somebody who was given it,
+            # and to them "removed on <date> because <why>" is the answer and
+            # "no such file" is a lie of omission that reads like their typo.
+            stone = self._gone(fid)
+            if stone is None:
+                return self._say(404, "no such file -- check the link\n")
+            if len(p) > 1 and p[1] == "meta":
+                return self._say(410, json.dumps(stone, indent=1,
+                                                 ensure_ascii=False) + "\n")
+            return self._say(410, "removed %s: %s.\n"
+                             "It was %s, %s bytes, sha256 %s, uploaded %s, %s.\n"
+                             "There is no undelete; if you find a copy elsewhere, "
+                             "check it against that sha256.\n" % (
+                                 _stamp(stone["removed"]),
+                                 _WHY.get(stone.get("why"), stone.get("why")),
+                                 stone.get("name"), stone.get("size"),
+                                 stone.get("sha256"), _stamp(stone.get("uploaded") or 0),
+                                 ("last downloaded " + _stamp(stone["last_read"]))
+                                 if stone.get("last_read") else "never downloaded"))
         if len(p) > 1 and p[1] == "meta":
             return self._say(200, json.dumps(
                 {k: m[k] for k in ("id", "name", "size", "sha256", "uploaded",
-                                   "keep_until", "expires") if k in m},
+                                   "last_read", "keep_until", "expires") if k in m},
                 indent=1, ensure_ascii=False) + "\n")
         if len(p) > 1:
-            return self._say(404, "no such file (wrong id, or it was removed)\n")
+            return self._say(404, "no such file -- check the link\n")
         try:
             data = open(os.path.join(ROOT, fid), "rb").read()
         except OSError:
             return self._say(410, "the metadata is here but the file is not "
                                   "-- report this, it should be impossible\n")
+        if self.command == "GET":
+            m = _renew(fid, time.time()) or m
         hdr = {
             "Content-Disposition": 'attachment; filename="%s"' % m["name"],
             "X-Sha256": m["sha256"],
@@ -548,7 +654,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = {"id": fid, "name": _safe_name(self.headers.get("X-Filename")),
                 "size": got, "sha256": h.hexdigest(),
                 "uploaded": int(now), "keep_until": int(now + ttl * 3600),
-                "token": secrets.token_urlsafe(16)}
+                "ttl_h": ttl, "token": secrets.token_urlsafe(16)}
         if hard:
             meta["expires"] = meta["keep_until"]
         with open(os.path.join(ROOT, fid + ".json"), "w", encoding="utf-8") as f:
@@ -569,8 +675,8 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("AGENTDROP-LOG-FAILED %r\n" % (e,))
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(meta["keep_until"]))
         kept = ("expires %s (deleted then, as asked)" % when if hard else
-                "kept-until %s at least; after that it stays until the box "
-                "needs the room" % when)
+                "kept-until %s at least, and every download extends it to %g "
+                "days from that download" % (when, ttl / 24))
         return self._say(201,
                          "%s/%s\n"
                          "sha256 %s\n"
@@ -587,17 +693,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._say(400, "DELETE %s/<id> with X-Delete-Token\n" % BASE)
         m = self._meta(p[0])
         if not m:
-            return self._say(404, "no such file (wrong id, or it was removed)\n")
+            return self._say(404, "no such file (wrong id, or it was already removed)\n")
         tok = self.headers.get("X-Delete-Token") or ""
         # Constant time: the token is the only thing standing between a reader
         # and deleting somebody else's file.
         if not secrets.compare_digest(tok, m.get("token", "")):
             return self._say(403, "wrong or missing X-Delete-Token\n")
-        for path in (os.path.join(ROOT, p[0]), os.path.join(ROOT, p[0] + ".json")):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        _remove(m, "DELETED")
+        _log_removed(m, "DELETED", time.time())
         return self._say(200, "deleted\n")
 
 

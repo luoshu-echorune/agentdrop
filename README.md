@@ -31,12 +31,14 @@ to each other, seconds apart. That is what the shape is for.
   Send the URL the way you would have sent the file. Nothing is encrypted for
   you; if the content is sensitive, encrypt it before uploading. The id is
   unguessable either way.
-- **A file is kept at least its time, then until the room is needed.** The
-  default guarantee is 72h (`X-TTL-Hours`, up to 168h). After that it stays
-  until an upload needs the space or the disk runs low, and the oldest goes
-  first; a file still inside its guarantee is never removed for space. If a
-  file must be gone by a set time, send `X-Delete-After-Hours` instead. Once
-  removed there is no undelete. It is not storage.
+- **A file stays as long as somebody keeps downloading it.** The upload and
+  every download each guarantee it `X-TTL-Hours` more (default 30 days). Only a
+  file nobody has downloaded for that long can be removed, and only when an
+  upload needs the space or the disk runs low -- the one unread longest goes
+  first. A removed file's URL answers `410` with when and why it went and the
+  sha256 it had; a link that never existed answers `404`. If a file must be gone
+  by a set time, send `X-Delete-After-Hours` instead. No undelete. It is not
+  storage: no listing, no account.
 - **No listing endpoint.** You cannot enumerate anyone else's ids — and neither
   can whoever runs it.
 - **Best effort, one small server, free.** If your handoff must not fail, keep
@@ -63,14 +65,16 @@ AGENTDROP_DIR=/var/lib/agentdrop python3 agentdrop.py
 Limits are defaults near the top of the file, each overridable by an
 environment variable (`AGENTDROP_MAX_BYTES`, `AGENTDROP_STORE_CAP`,
 `AGENTDROP_DISK_FLOOR`, `AGENTDROP_TTL_H`, `AGENTDROP_MAX_TTL_H`): 25 MiB per
-file, a 2 GiB total store, a 1 GiB free-disk floor, 72h guaranteed keep by default (168h max). The total cap is
+file, a 2 GiB total store, a 1 GiB free-disk floor, a 30-day keep window renewed by every download. The total cap is
 enforced with a lock around check-and-reserve — the first version checked and
 then wrote, which on a threading server is a limit every racer passes, i.e. not
 a limit at all. The disk floor is separate on purpose: our own quota cannot
 stop somebody else filling the disk, and something else lives on that machine.
 Those two limits, not a clock, decide when a file goes: until 2026-11-05 every
 file was deleted at its TTL even with the store nearly empty, and somebody lost
-a file they wanted back to protect a disk that was in no danger.
+a file they wanted back to protect a disk that was in no danger. The keep window
+is measured from the last download, not the upload, because a file somebody
+keeps fetching is in use.
 
 Refusals say which limit was hit: `413` oversized, `507` store full or disk
 floor reached with every file still inside its guarantee, `503` cannot read the
