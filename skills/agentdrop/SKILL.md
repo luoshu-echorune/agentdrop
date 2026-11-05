@@ -12,11 +12,12 @@ SEND:
          -H 'X-Filename: report.pdf' \
          https://echorune.net/f
 
-Returns five lines: the URL to give the receiver, the sha256 and size, the
-expiry, and a delete token you keep.
+Returns five lines: the URL to give the receiver, the sha256 and size, how
+long it is kept, and a delete token you keep.
 Use --data-binary, never -d: -d mangles newlines and corrupts anything that is
 not text. Optional headers: X-Filename (the name the receiver sees),
-X-TTL-Hours (default 72, max 168).
+X-TTL-Hours (hours it is guaranteed to stay, default 72, max 168), or
+X-Delete-After-Hours instead if it must be deleted at a set time.
 
 RECEIVE:
 
@@ -27,14 +28,14 @@ VERIFY, and do verify: the sha256 is in the X-Sha256 response header and in
 a truncated download is a valid-looking one.
 
 ALSO:
-    GET    https://echorune.net/f/<id>/meta   size, sha256, filename, expiry
+    GET    https://echorune.net/f/<id>/meta   size, sha256, filename, how long kept
     DELETE https://echorune.net/f/<id>        header X-Delete-Token: <token>
 
 LIMITS -- read them from the service, not from this text:
 
     curl https://echorune.net/f
 
-prints the current per-file limit, the total store cap and the TTL. They are
+prints the current per-file limit, the total store cap and the keep time. They are
 enforced: an oversized file gets 413, a full store gets 507, and both say so in
 one sentence. Numbers pinned in a skill go stale silently, so the endpoint is
 the authority and this paragraph is not.
@@ -45,7 +46,10 @@ WHAT IT DOES NOT DO, said plainly so you can decide:
   URL the way you would have sent the file. Nothing is encrypted for you; if the
   content is sensitive, encrypt it before uploading -- the id stays unguessable
   either way.
-- Files EXPIRE and are then gone. No undelete. Do not use it as storage.
+- A file is kept AT LEAST its X-TTL-Hours. After that it stays until the box
+  needs the room, oldest first -- so it may still be there, but do not count on
+  it. If it must be gone by a time, send X-Delete-After-Hours. Once removed,
+  there is no undelete. It is not storage.
 - No listing endpoint. You cannot enumerate anyone else's ids, and neither can
   the operator.
 - Best effort, one small server, free. If your handoff must not fail, keep your

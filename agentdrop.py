@@ -31,9 +31,17 @@ What it refuses to do, each for a reason paid for elsewhere in this repo:
    the whole file" are two claims, and without a digest they print the same.
  * **Full disk is an explicit refusal, not a corrupt file.** Over the store
    cap, uploads get 507 and say so.
- * **Everything expires.** Default 72h, max 168h. A drop box with no TTL is a
-   file host, and a file host on a box with 9GB free is an outage waiting for
-   somebody to notice.
+ * **A file is kept AT LEAST its time, not at most.** Default 72h, max 168h
+   guaranteed; after that it stays until the box needs the room, and then the
+   oldest goes first. Changed 2026-11-05 because bob wanted a file back that
+   had been deleted on the dot at 72h while the box sat nearly empty -- the
+   deadline was deleting things to protect a disk that was in no danger. What
+   protects the disk is the store cap and the free-space floor, so those stay
+   and are what decide removal now: an upload that does not fit, or the disk
+   dropping under the floor, removes files past their guarantee, never one
+   still inside it. An uploader who wants a hard deadline (the old behaviour)
+   asks for it with X-Delete-After-Hours, and files uploaded before this change
+   keep the deadline they were promised.
 """
 import hashlib
 import json
@@ -59,6 +67,7 @@ STORE_CAP = int(os.environ.get("AGENTDROP_STORE_CAP", str(2 * 1024 * 1024 * 1024
 #: Free space we refuse to go below, whatever our own quota says.
 DISK_FLOOR = int(os.environ.get("AGENTDROP_DISK_FLOOR",
                                 str(1024 * 1024 * 1024)))
+#: Hours a file is guaranteed to stay. Not a deadline: see the docstring.
 DEFAULT_TTL_H = float(os.environ.get("AGENTDROP_TTL_H", "72"))
 MAX_TTL_H = float(os.environ.get("AGENTDROP_MAX_TTL_H", "168"))
 
@@ -70,11 +79,13 @@ SEND (any HTTP client, no account, no key):
          -H 'X-Filename: report.pdf' \\
          %(base)s
 
-  -> five lines: the URL to give the receiver, its sha256 and size, when it
-     expires, and a delete token for you.
-     Optional: X-Filename (name the receiver sees), X-TTL-Hours (default %(ttl)g,
-     max %(maxttl)g). Use --data-binary, never -d: -d mangles newlines and will
-     corrupt anything that is not text.
+  -> five lines: the URL to give the receiver, its sha256 and size, how long
+     it is kept, and a delete token for you.
+     Optional: X-Filename (name the receiver sees), X-TTL-Hours (hours it is
+     guaranteed to stay, default %(ttl)g, max %(maxttl)g), X-Delete-After-Hours
+     (a hard deadline instead: deleted then, max %(maxttl)g; send one or the
+     other). Use --data-binary, never -d: -d mangles newlines and will corrupt
+     anything that is not text.
 
 RECEIVE:
 
@@ -85,12 +96,14 @@ RECEIVE:
 
 ALSO:
 
-    GET  %(base)s/<id>/meta      size, sha256, filename, expiry -- no body
+    GET  %(base)s/<id>/meta      size, sha256, filename, how long kept -- no body
     DELETE %(base)s/<id>         with header X-Delete-Token: <token>
 
-LIMITS: %(max)d bytes per file, %(cap)d bytes total, expires after the TTL and
-is then gone. There is no undelete and no listing -- you cannot enumerate other
-people's ids, and neither can we.
+LIMITS: %(max)d bytes per file, %(cap)d bytes total. A file is kept at least
+its X-TTL-Hours; after that it stays until the box needs the room, and the
+oldest goes first. With X-Delete-After-Hours it is deleted at that time instead.
+Once removed there is no undelete. There is no listing -- you cannot enumerate
+other people's ids, and neither can we.
 
 THE LINK IS THE CREDENTIAL. Anyone holding the URL can read the file, so send
 it the way you would have sent the file. Prefer https. This service does not
@@ -122,7 +135,7 @@ def _safe_name(raw):
 #: space it exists to describe. Found 2026-09-03 by firing the cap and reading
 #: "704 of 250 bytes used" against an empty store -- the guard refused, and for
 #: a reason it did not claim.
-_NOT_PAYLOAD = ("uploads.log",)
+_NOT_PAYLOAD = ("uploads.log", "removed.log")
 
 
 def _store_bytes():
@@ -152,6 +165,84 @@ _QLOCK = threading.Lock()
 _reserved = 0
 
 
+def _kept_until(m):
+    """The time before which this file must not be removed for space.
+
+    Files written before 2026-11-05 carry only `expires`, which was both their
+    guarantee and their deadline; reading it as the guarantee keeps the promise
+    they were given.
+    """
+    return m.get("keep_until", m.get("expires", 0))
+
+
+def _log_removed(m, why, now):
+    """One line per file removed for space or by its deadline.
+
+    In its own file, not uploads.log: two readers split that log into six
+    fields and count every row that is not REFUSED as an upload, so a removal
+    line there would be counted as a new file. Removing for space is new
+    behaviour, and a removal that leaves no trace is the question nobody can
+    answer on the day somebody asks where their file went.
+    """
+    try:
+        with open(os.path.join(ROOT, "removed.log"), "a", encoding="utf-8") as lg:
+            lg.write("%s %s %s %d uploaded=%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                why, m.get("id", "?"), m.get("size", 0),
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(m.get("uploaded", 0)))))
+    except OSError as e:
+        sys.stderr.write("AGENTDROP-LOG-FAILED %r\n" % (e,))
+
+
+def _remove(m):
+    for path in (os.path.join(ROOT, m["id"]), os.path.join(ROOT, m["id"] + ".json")):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _make_room(need_store, need_free, now=None):
+    """Remove files past their guarantee, oldest upload first, until both
+    `store bytes <= need_store` and `free disk >= need_free`, or until nothing
+    removable is left. Returns how many went.
+
+    A file still inside its guarantee is never a candidate, whatever the
+    pressure: the guarantee is the one thing this service promises, and an
+    upload being refused with 507 is the honest outcome when the room is all
+    promised to others.
+    """
+    now = now or time.time()
+    cands = []
+    try:
+        for f in os.scandir(ROOT):
+            if not f.name.endswith(".json"):
+                continue
+            try:
+                m = json.load(open(f.path, encoding="utf-8"))
+                m["id"]
+            except Exception:
+                continue        # cannot identify it -> never delete it (see _sweep)
+            if _kept_until(m) <= now:
+                cands.append(m)
+    except OSError:
+        return 0
+    cands.sort(key=lambda m: (m.get("uploaded", 0), m["id"]))
+    gone = 0
+    for m in cands:
+        used = _store_bytes()
+        try:
+            free = shutil.disk_usage(ROOT).free
+        except OSError:
+            break
+        if used is not None and used <= need_store and free >= need_free:
+            break
+        _remove(m)
+        _log_removed(m, "ROOM", now)
+        gone += 1
+    return gone
+
+
 def _reserve(length):
     """Take `length` out of the quota, or return the refusal string."""
     global _reserved
@@ -159,9 +250,19 @@ def _reserve(length):
         used = _store_bytes()
         if used is None:
             return "cannot read the store to check the quota -- refusing rather than guessing"
+        try:
+            free = shutil.disk_usage(ROOT).free
+        except OSError as e:
+            return "cannot read free disk space (%s) -- refusing rather than guessing" % e
+        if used + _reserved + length > STORE_CAP or free - length < DISK_FLOOR:
+            _make_room(STORE_CAP - _reserved - length, DISK_FLOOR + length)
+            used = _store_bytes()
+            if used is None:
+                return "cannot read the store to check the quota -- refusing rather than guessing"
         if used + _reserved + length > STORE_CAP:
             return ("the drop box is full (%d of %d bytes used, %d more in flight)"
-                    " -- files expire, try later" % (used, STORE_CAP, _reserved))
+                    " and every file in it is still inside the time it was"
+                    " promised -- try later" % (used, STORE_CAP, _reserved))
         try:
             free = shutil.disk_usage(ROOT).free
         except OSError as e:
@@ -184,7 +285,14 @@ def _release(length):
 
 
 def _sweep(now=None):
-    """Delete what has expired. Returns how many went.
+    """Delete what has passed a hard deadline, and give disk back if the
+    machine is under the free-space floor. Returns how many went.
+
+    Only files with `expires` have a deadline (asked for with
+    X-Delete-After-Hours, or uploaded before 2026-11-05). Everything else stays
+    until the room is needed -- and the machine needing it counts: the weather
+    service shares this disk, so when free space falls under the floor for any
+    reason, files past their guarantee go even with no upload asking.
 
     Runs on every request rather than only on a timer: a timer that dies leaves
     a drop box that silently never expires anything, and the symptom of that is
@@ -201,17 +309,24 @@ def _sweep(now=None):
             continue
         try:
             m = json.load(open(f.path, encoding="utf-8"))
-            if m.get("expires", 0) > now:
+            if "expires" not in m or m["expires"] > now:
                 continue
             blob = os.path.join(ROOT, m["id"])
             if os.path.exists(blob):
                 os.unlink(blob)
             os.unlink(f.path)
+            _log_removed(m, "DEADLINE", now)
             gone += 1
         except Exception:
             # A meta file we cannot parse is not a licence to delete a blob we
             # cannot identify. Leave it and let the operator see it.
             continue
+    try:
+        if shutil.disk_usage(ROOT).free < DISK_FLOOR:
+            with _QLOCK:
+                gone += _make_room(STORE_CAP, DISK_FLOOR, now)
+    except OSError:
+        pass
     return gone
 
 
@@ -220,6 +335,36 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # ---------- plumbing ----------
+
+    def _refused(self, code, length):
+        """Record an upload that did NOT happen.
+
+        2026-09-07. Until today this log was written on the success path only,
+        so a refusal left no trace at all -- and "nobody tried" and "somebody
+        tried and we said no" were the same absence. That is the rule I wrote
+        for my own outbox on 2026-08-12 and then did not apply to the service
+        other beings actually depend on.
+
+        It matters here more than there. The measured use of this box is beings
+        moving their own memory and handoff notes between machines, and the
+        real uploads already run to 6.8 and 9.8 MB against a 25 MB limit. The
+        first being whose handoff is too big gets one sentence back and I never
+        learn it happened -- while the log keeps saying use is healthy, because
+        every line in it is a success by construction.
+
+        The success line above is left byte-identical on purpose: the reader
+        splits into six fields and years of history parse that way. A refusal
+        is marked in the id column, which is where an id would otherwise be and
+        can never be confused with one.
+        """
+        try:
+            with open(os.path.join(ROOT, "uploads.log"), "a",
+                      encoding="utf-8") as lg:
+                lg.write("%s REFUSED %s %d - %s\n" % (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    self._client(), max(int(length or 0), 0), code))
+        except OSError as e:
+            sys.stderr.write("AGENTDROP-LOG-FAILED %r\n" % (e,))
 
     def log_message(self, fmt, *a):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % a))
@@ -276,28 +421,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._say(400, "bad id -- ids are 22 url-safe characters\n")
         m = self._meta(fid)
         if not m:
-            # One word for both "never existed" and "expired". They are the
+            # One word for both "never existed" and "removed". They are the
             # same fact to the caller -- there is nothing at this URL -- and
             # distinguishing them would let somebody probe which ids were real.
-            return self._say(404, "no such file (wrong id, or it expired)\n")
+            return self._say(404, "no such file (wrong id, or it was removed)\n")
         if len(p) > 1 and p[1] == "meta":
             return self._say(200, json.dumps(
                 {k: m[k] for k in ("id", "name", "size", "sha256", "uploaded",
-                                   "expires") if k in m},
+                                   "keep_until", "expires") if k in m},
                 indent=1, ensure_ascii=False) + "\n")
         if len(p) > 1:
-            return self._say(404, "no such file (wrong id, or it expired)\n")
+            return self._say(404, "no such file (wrong id, or it was removed)\n")
         try:
             data = open(os.path.join(ROOT, fid), "rb").read()
         except OSError:
             return self._say(410, "the metadata is here but the file is not "
                                   "-- report this, it should be impossible\n")
-        return self._say(200, None, body=data, headers={
+        hdr = {
             "Content-Disposition": 'attachment; filename="%s"' % m["name"],
             "X-Sha256": m["sha256"],
-            "X-Expires": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                       time.gmtime(m["expires"])),
-        })
+            "X-Kept-Until": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          time.gmtime(_kept_until(m))),
+        }
+        if "expires" in m:
+            hdr["X-Expires"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                             time.gmtime(m["expires"]))
+        return self._say(200, None, body=data, headers=hdr)
 
     def do_HEAD(self):
         return self.do_GET(head=True)
@@ -321,6 +470,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length <= 0:
+            self._refused("no-content-length", length)
             # Chunked bodies are refused rather than half-supported: a client
             # that thinks it uploaded and got a 200 for nothing is the worst
             # outcome available here.
@@ -328,21 +478,33 @@ class Handler(BaseHTTPRequestHandler):
                                   "(curl --data-binary @file does this; "
                                   "chunked uploads are not supported)\n")
         if length > MAX_BYTES:
+            self._refused("too-big", length)
             return self._say(413, "too big: %d bytes, limit is %d\n"
                              % (length, MAX_BYTES))
-        # Sweep first: expiry is what makes room, so a full box should be
-        # asked to empty itself before it is called full.
+        # Read the time headers BEFORE taking quota: a request we are about to
+        # refuse for a bad header must not first remove somebody's file to make
+        # room for it.
+        hard = self.headers.get("X-Delete-After-Hours")
+        if hard and self.headers.get("X-TTL-Hours"):
+            return self._say(400, "send X-TTL-Hours (kept at least) or "
+                                  "X-Delete-After-Hours (deleted then), not both\n")
+        name, raw = (("X-Delete-After-Hours", hard) if hard
+                     else ("X-TTL-Hours", self.headers.get("X-TTL-Hours")))
+        try:
+            ttl = float(raw or DEFAULT_TTL_H)
+        except ValueError:
+            return self._say(400, "%s must be a number of hours\n" % name)
+        if not (0 < ttl <= MAX_TTL_H):
+            return self._say(400, "%s must be >0 and <= %g\n" % (name, MAX_TTL_H))
+        # Sweep first: deadlines make room, so a full box should be asked to
+        # empty itself before it is called full. _reserve then removes files
+        # past their guarantee if that is still not enough.
         _sweep()
         why = _reserve(length)
         if why:
             code = 503 if why.startswith("cannot read") else 507
+            self._refused("full" if code == 507 else "cannot-measure", length)
             return self._say(code, why + "\n")
-        try:
-            ttl = float(self.headers.get("X-TTL-Hours") or DEFAULT_TTL_H)
-        except ValueError:
-            return self._say(400, "X-TTL-Hours must be a number of hours\n")
-        if not (0 < ttl <= MAX_TTL_H):
-            return self._say(400, "X-TTL-Hours must be >0 and <= %g\n" % MAX_TTL_H)
 
         fid = secrets.token_urlsafe(16)[:22]
         tmp = os.path.join(ROOT, ".tmp." + fid)
@@ -385,8 +547,10 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         meta = {"id": fid, "name": _safe_name(self.headers.get("X-Filename")),
                 "size": got, "sha256": h.hexdigest(),
-                "uploaded": int(now), "expires": int(now + ttl * 3600),
+                "uploaded": int(now), "keep_until": int(now + ttl * 3600),
                 "token": secrets.token_urlsafe(16)}
+        if hard:
+            meta["expires"] = meta["keep_until"]
         with open(os.path.join(ROOT, fid + ".json"), "w", encoding="utf-8") as f:
             json.dump(meta, f)
         # An open drop box with no record of what went into it cannot answer
@@ -403,16 +567,17 @@ class Handler(BaseHTTPRequestHandler):
                     fid, self._client(), got, meta["sha256"], meta["name"]))
         except OSError as e:
             sys.stderr.write("AGENTDROP-LOG-FAILED %r\n" % (e,))
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(meta["keep_until"]))
+        kept = ("expires %s (deleted then, as asked)" % when if hard else
+                "kept-until %s at least; after that it stays until the box "
+                "needs the room" % when)
         return self._say(201,
                          "%s/%s\n"
                          "sha256 %s\n"
                          "size %d bytes\n"
-                         "expires %s\n"
+                         "%s\n"
                          "delete-token %s\n"
-                         % (BASE, fid, meta["sha256"], got,
-                            time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                          time.gmtime(meta["expires"])),
-                            meta["token"]))
+                         % (BASE, fid, meta["sha256"], got, kept, meta["token"]))
 
     def do_DELETE(self):
         p = self._parts()
@@ -422,7 +587,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._say(400, "DELETE %s/<id> with X-Delete-Token\n" % BASE)
         m = self._meta(p[0])
         if not m:
-            return self._say(404, "no such file (wrong id, or it expired)\n")
+            return self._say(404, "no such file (wrong id, or it was removed)\n")
         tok = self.headers.get("X-Delete-Token") or ""
         # Constant time: the token is the only thing standing between a reader
         # and deleting somebody else's file.
